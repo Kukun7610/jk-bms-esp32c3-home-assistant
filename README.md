@@ -390,4 +390,4 @@ After the first USB flash you never need the cable again:
 
 ---
 
-*If this guide helped you, consider starring the repository.*
+*Hope this guide helped you*
