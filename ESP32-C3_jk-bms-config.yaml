@@ -1,7 +1,8 @@
 # =============================================================================
 # JK-BMS (BLE) -> ESP32-C3 Super Mini -> Home Assistant
 # Based on syssi/esphome-jk-bms, with an added ESTIMATED State of Health (SoH)
-# calculated from the BMS charging-cycle counter.
+# calculated from the BMS charging-cycle counter, plus an ADVANCED SoH estimate
+# that also considers temperature, C-rate (current) and calendar time.
 # =============================================================================
 
 # ---- SUBSTITUTIONS: reusable values, referenced below as ${name} ------------
@@ -20,12 +21,34 @@ substitutions:
   protocol_version: JK02_32S
 
   # ---- SoH model settings (edit these to match your battery datasheet) ------
-  soh_rated_cycles: "6000"   # cycles the battery is rated for ...
+  # Values below are from the Highstar IFpP40130220-100 (100 Ah LFP) datasheet:
+  # "Cycle life >= 5000 cycles" until capacity falls below 80 % (sheet 7, item 11)
+  soh_rated_cycles: "5000"   # cycles the battery is rated for ...
   soh_end_of_life: "80.0"    # ... until it reaches this SoH (%)
+
+  # ---- ADVANCED SoH model settings -----------------------------------------
+  # The datasheet rating above is assumed to be measured at the REFERENCE
+  # conditions below. At these conditions the advanced model wears the battery
+  # at exactly the datasheet rate. Hotter / higher current = faster wear.
+  # NOTE: stress factors and calendar loss are ASSUMPTIONS (typical LFP values),
+  # not lab-fitted constants. Adjust them if your datasheet says otherwise.
+  soh_pack_capacity_ah: "100"        # total pack Ah. 16S1P of 100 Ah cells = 100 (16S2P would be 200)
+  soh_ref_temp_c: "25.0"             # datasheet cycle test is at 23 +/- 5 deg C
+  soh_ref_c_rate: "0.5"              # datasheet cycle test: 150 W per cell (about 0.5C = 50 A on 100 Ah)
+  soh_temp_doubling_c: "10.0"        # wear doubles for every +10 deg C above reference
+  soh_c_rate_gamma: "0.5"            # extra wear per 1C above the reference C-rate
+  soh_calendar_loss_per_year: "1.0"  # % capacity lost per year just from age at ref temp (0 = disable)
 
 # ---- CORE ESPHOME SETTINGS -------------------------------------------------
 esphome:
   name: ${name}
+
+# ---- PREFERENCES: how often saved values are written to flash ---------------
+# The advanced SoH total is stored in flash so it survives reboots/power cuts.
+# Flash wears out if written too often, so write only every 30 minutes.
+# (A power cut can lose at most the last 30 minutes of accumulated wear.)
+preferences:
+  flash_write_interval: 30min
 
 # ---- HARDWARE: ESP32-C3 board and framework -------------------------------
 esp32:
@@ -55,6 +78,107 @@ ota:
       # Write a note to the log
       - logger.log: "BLE connection suspended for OTA update"
 
+# ---- GLOBALS: variables that live in memory (some are saved to flash) -------
+globals:
+  # Total capacity lost so far, in percent (e.g. 2.0 = battery at 98.00 % SoH)
+  # (double = high precision, because each 10 s step adds a VERY tiny amount)
+  - id: soh_total_loss
+    type: double
+    restore_value: yes        # saved to flash, survives reboot
+    initial_value: '0.0'
+
+  # Has the loss total been seeded from the BMS cycle count yet?
+  # (so a battery that already has cycles does not start at 100 %)
+  - id: soh_seeded
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # Equivalent full cycles counted by the ESP32 (energy throughput based)
+  - id: soh_equiv_cycles
+    type: double
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Current combined stress multiplier (1.0 = datasheet conditions)
+  - id: soh_stress_now
+    type: float
+    restore_value: no
+    initial_value: '1.0'
+
+# ---- INTERVAL: runs the advanced SoH calculation every 10 seconds ------------
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          // ---- STEP 1: loss per cycle at datasheet conditions (% per full cycle)
+          // (100 - 80) / 5000 = 0.004 % with the default substitutions
+          // (double precision: the per-step amounts are tiny, float would round them away)
+          const double loss_per_cycle = (100.0 - static_cast<double>(${soh_end_of_life})) / static_cast<double>(${soh_rated_cycles});
+
+          // ---- STEP 2: seed the total once from the BMS cycle count.
+          // A battery that already has e.g. 500 cycles starts at 98.00 %, not 100 %.
+          // After seeding, only NEW wear is added (with temperature/current stress).
+          if (!id(soh_seeded)) {
+            if (!id(bms_charging_cycles).has_state()) return;   // wait for BMS data
+            const float c0 = id(bms_charging_cycles).state;
+            if (std::isnan(c0)) return;
+            id(soh_total_loss) = c0 * loss_per_cycle;
+            id(soh_seeded) = true;
+          }
+
+          // ---- STEP 3: average battery temperature from probes 1 and 2.
+          // If no probe value is available, assume the reference temperature.
+          float t_sum = 0.0f;
+          int t_n = 0;
+          if (id(bms_temp1).has_state() && !std::isnan(id(bms_temp1).state)) { t_sum += id(bms_temp1).state; t_n++; }
+          if (id(bms_temp2).has_state() && !std::isnan(id(bms_temp2).state)) { t_sum += id(bms_temp2).state; t_n++; }
+          const float temp_c = (t_n > 0) ? (t_sum / t_n) : static_cast<float>(${soh_ref_temp_c});
+
+          // ---- STEP 4: absolute pack current in amps (charge OR discharge both wear).
+          float amps = 0.0f;
+          if (id(bms_current).has_state() && !std::isnan(id(bms_current).state)) {
+            amps = std::fabs(id(bms_current).state);
+          }
+
+          // ---- STEP 5: temperature stress factor (Arrhenius-style rule of thumb).
+          // 1.0 at/below the reference temp, 2.0 at +10 C, 4.0 at +20 C. Capped at 4.
+          // No "bonus" is given for cold, which is the conservative choice.
+          float temp_factor = std::pow(2.0f, (temp_c - static_cast<float>(${soh_ref_temp_c})) / static_cast<float>(${soh_temp_doubling_c}));
+          if (temp_factor < 1.0f) temp_factor = 1.0f;
+          if (temp_factor > 4.0f) temp_factor = 4.0f;
+
+          // ---- STEP 6: C-rate stress factor (current divided by capacity).
+          // 1.0 up to the reference C-rate; grows linearly above it. Capped at 3.
+          const float cap_ah = static_cast<float>(${soh_pack_capacity_ah});
+          const float c_rate = amps / cap_ah;
+          float c_factor = 1.0f;
+          if (c_rate > static_cast<float>(${soh_ref_c_rate})) {
+            c_factor = 1.0f + static_cast<float>(${soh_c_rate_gamma}) * (c_rate - static_cast<float>(${soh_ref_c_rate}));
+          }
+          if (c_factor > 3.0f) c_factor = 3.0f;
+
+          // ---- STEP 7: time step: this block runs every 10 s = 10/3600 hours.
+          const double dt_h = 10.0 / 3600.0;
+
+          // ---- STEP 8: cycling wear.
+          // Ah moved in this step, converted to "equivalent full cycles":
+          // one full cycle = charge + discharge = 2 x pack capacity of throughput.
+          const double efc_step = (static_cast<double>(amps) * dt_h) / (2.0 * cap_ah);
+          id(soh_equiv_cycles) += efc_step;
+          const double loss_cycling = efc_step * loss_per_cycle * temp_factor * c_factor;
+
+          // ---- STEP 9: calendar wear (loss from age alone, faster when hot).
+          const double loss_calendar = (static_cast<double>(${soh_calendar_loss_per_year}) / 8760.0) * dt_h * temp_factor;
+
+          // ---- STEP 10: add both to the running total (in %) and keep it sane.
+          id(soh_total_loss) += loss_cycling + loss_calendar;
+          if (id(soh_total_loss) > 100.0) id(soh_total_loss) = 100.0;
+          if (id(soh_total_loss) < 0.0) id(soh_total_loss) = 0.0;
+
+          // ---- STEP 11: remember the stress level (shown as a sensor for transparency).
+          id(soh_stress_now) = (amps > 0.0f) ? (temp_factor * c_factor) : temp_factor;
+
 # ---- LOGGER: debug output (view in ESPHome logs) ----------------------------
 logger:
   level: DEBUG
@@ -67,7 +191,7 @@ logger:
 # If you don't use Home Assistant please remove this `api` section and use `mqtt`.
 api:
   encryption:
-    key: "XXX"   # <-- put your own API encryption key here
+    key: "XXXXXXXXXX"
 
 # ---- BLE TRACKER: scans for Bluetooth devices -------------------------------
 esp32_ble_tracker:
@@ -104,6 +228,17 @@ binary_sensor:
 
 # ---- BUTTONS: trigger actions on the BMS ------------------------------------
 button:
+  # Re-seed the advanced SoH from the BMS cycle count (use after replacing the
+  # battery or if you want to restart the tracking from the cycle-based value)
+  - platform: template
+    name: "Reset Advanced SoH Tracking"
+    icon: mdi:restart
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(soh_seeded) = false;
+          id(soh_equiv_cycles) = 0.0;
+
   - platform: jk_bms_ble
     retrieve_settings:
       name: "retrieve settings"
@@ -378,6 +513,7 @@ sensor:
 
     current:
       name: "current"
+      id: bms_current   # used by the advanced SoH calculation
 
     heating_current:
       name: "heating current"
@@ -394,9 +530,11 @@ sensor:
     # Temperature probes and MOSFET temperature
     temperature_sensor_1:
       name: "temperature sensor 1"
+      id: bms_temp1     # used by the advanced SoH calculation
 
     temperature_sensor_2:
       name: "temperature sensor 2"
+      id: bms_temp2     # used by the advanced SoH calculation
 
     temperature_sensor_3:
       name: "temperature sensor 3"
@@ -442,7 +580,7 @@ sensor:
   # 2) ESTIMATED STATE OF HEALTH (calculated on the ESP32, NOT read from BMS)
   #
   #   loss per cycle = (100 - end_of_life) / rated_cycles
-  #                  = (100 - 80) / 6000 = 0.003333 % per cycle
+  #                  = (100 - 80) / 5000 = 0.004 % per cycle
   #   SoH            = 100 - (cycles * loss per cycle)      (clamped 0..100)
   # ===========================================================================
   - platform: template                    # a sensor whose value is computed by our code
@@ -451,7 +589,7 @@ sensor:
     unit_of_measurement: "%"              # displayed as a percentage
     icon: mdi:battery-heart-variant       # icon in Home Assistant
     state_class: measurement              # lets HA keep long-term statistics/graphs
-    accuracy_decimals: 2                  # show 2 decimals, e.g. 98.33 %
+    accuracy_decimals: 2                  # show 2 decimals, e.g. 98.00 %
     update_interval: 30s                  # recalculate every 30 seconds
     lambda: |-
       // STEP 1: if the BMS has not sent a cycle count yet, publish nothing.
@@ -465,7 +603,7 @@ sensor:
       if (std::isnan(cycles)) return {};
 
       // STEP 4: calculate the SoH lost per cycle.
-      // (100 - 80) / 6000 = 0.003333 % per cycle with the default substitutions.
+      // (100 - 80) / 5000 = 0.004 % per cycle with the default substitutions.
       // static_cast<float> converts the substitution text to a decimal number.
       const float loss_per_cycle = (100.0f - static_cast<float>(${soh_end_of_life})) / static_cast<float>(${soh_rated_cycles});
 
@@ -498,7 +636,7 @@ sensor:
       // STEP 3: ignore invalid readings.
       if (std::isnan(cycles)) return {};
 
-      // STEP 4: remaining = rated cycles (6000) - cycles already used.
+      // STEP 4: remaining = rated cycles (5000) - cycles already used.
       float remaining = static_cast<float>(${soh_rated_cycles}) - cycles;
 
       // STEP 5: never show a negative number once past the rated life.
@@ -506,6 +644,53 @@ sensor:
 
       // STEP 6: publish the value to Home Assistant.
       return remaining;
+
+  # ===========================================================================
+  # 3) ADVANCED STATE OF HEALTH ESTIMATE
+  #    Uses the running loss total from the 'interval' block above.
+  #    Takes into account cycles, temperature, current (C-rate) and calendar age.
+  # ===========================================================================
+  - platform: template
+    name: "State of Health (Advanced Estimate)"
+    id: soh_advanced
+    unit_of_measurement: "%"
+    icon: mdi:battery-heart-variant
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      // Wait until the loss total has been seeded from the BMS cycle count.
+      if (!id(soh_seeded)) return {};
+      // SoH = 100 % minus total accumulated loss, kept within 0 - 100 %.
+      float soh = 100.0f - static_cast<float>(id(soh_total_loss));
+      if (soh > 100.0f) soh = 100.0f;
+      if (soh < 0.0f) soh = 0.0f;
+      return soh;
+
+  # Current wear multiplier: 1.0 = datasheet conditions, 2.0 = wearing twice as fast
+  - platform: template
+    name: "Battery Aging Stress Factor"
+    id: aging_stress_factor
+    unit_of_measurement: "x"
+    icon: mdi:thermometer-alert
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      return id(soh_stress_now);
+
+  # Equivalent full cycles counted by the ESP32 from energy throughput
+  # (counts from when the advanced tracking started)
+  - platform: template
+    name: "Equivalent Full Cycles (Tracked)"
+    id: equiv_full_cycles
+    unit_of_measurement: "cycles"
+    icon: mdi:counter
+    state_class: total_increasing
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      return static_cast<float>(id(soh_equiv_cycles));
 
 # ---- SWITCHES: turn BMS functions on/off from Home Assistant ----------------
 switch:
