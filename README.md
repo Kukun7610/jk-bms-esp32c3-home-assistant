@@ -243,6 +243,8 @@ The running wear total and the last measured capacity are stored in the ESP32's 
 
 In Home Assistant: **Dashboard → Edit → Add card → Manual**, then paste. Entity names can differ slightly, so check yours under **Settings → Devices → jk-bms**.
 
+![HA overview](https://raw.githubusercontent.com/Kukun7610/jk-bms-esp32c3-home-assistant/refs/heads/main/IMG.png)
+
 **Overview card:**
 
 ```yaml
