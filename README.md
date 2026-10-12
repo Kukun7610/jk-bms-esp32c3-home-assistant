@@ -16,6 +16,7 @@ This project adds something the BMS does not provide: **three State of Health (S
 | File | Purpose |
 |---|---|
 | `ESP32-C3_jk-bms-config.yaml` | The ESPHome configuration (paste this into ESPHome) |
+| `IMG.png` | The Home assistant Dashboard Entity reference |
 | [`INSTALLATION.md`](INSTALLATION.md) | Beginner step-by-step setup guide |
 | `README.md` | This page: how the SoH calculation works |
 
